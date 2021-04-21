@@ -1,0 +1,441 @@
+# http://krasserm.github.io/2019/03/14/bayesian-neural-networks/
+
+# I denne koden vil jeg normalisere input, og så sette opp sånn at jeg kan tilpasse prior sigmas til den settinga
+# "betteruncertainty-200tanh-200relu" nekter å tilpasse like bra som bbb-mmm, selv om jeg kommer nærme i parameterverier
+# Her: forsøk på å gjenskape bbb-mmm
+
+# Randomisere data? er nå i x-rekkefølge
+# Normalisere data? pass på noise-parameteren som brukes i loss'en (log-likelihood).
+
+# I'm currently only monitoring mse - maybe KS should also be viewed? Does extra epochs after
+# convergence in terms of mean create a better uncertainty fit? One should monitor that using
+# a specially made KS metric function that keras can apply during training/callbacks. I suspect that a lot of weird
+# results in uncertainty are due to too few epoch, though mean has converged. Or maybe more epochs do nothing?
+# Could save all parameters with model.save, print all figures, then load and resume training. This could give
+# visual checkpoints
+
+# what about minibatch/batch size and other things? Should they be considered from a regularization perspective?
+# Talk about the balance between regularization and the lack thereof: too much or too little are both bad.
+
+# Talk about which callbacks are used. See notes from last talk with Jo to see where to pick up, what to do in report.
+###
+### This code has new things like monitoring and reporting mse metrics so I dont have to use my own mse function.
+# Substantial improvement over BBB-multiple means runs
+
+# add python time, so you can monitor runtime. see comments from JO
+
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import random
+import os
+import tensorflow as tf
+import math
+from statistics import mean
+from keras import backend as K
+# import keras as K
+import gc
+import time
+
+# print(os.getcwd())
+
+'''
+def f(x, sigma):
+    epsilon = np.random.randn(*x.shape) * sigma
+    return 10 * np.sin(2 * np.pi * (x)) + epsilon
+    #return 5*x-1 + epsilon
+'''
+
+
+def f(x, sigma):
+    epsilon = np.random.randn(*x.shape) * sigma
+    outvector = 10 * np.sin(2 * np.pi * x) + epsilon
+    '''
+    m=np.mean(outvector, axis=0)
+    print(m)
+    s=np.std(outvector, axis=0)
+    print(s)
+    
+    outvector = (outvector - m)/s
+    '''
+    return outvector
+    # return 5*x-1 + epsilon
+
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# SEEDING:  https://stackoverflow.com/questions/50659482/why-cant-i-get-reproducible-results-in-keras-even-though-i-set-the-random-seeds
+seed_value =  1
+# 1. Set `PYTHONHASHSEED` environment variable at a fixed value
+os.environ['PYTHONHASHSEED'] = str(seed_value)
+# 2. Set `python` built-in pseudo-random generator at a fixed value
+random.seed(seed_value)
+# 3. Set `numpy` pseudo-random generator at a fixed value
+np.random.seed(seed_value)
+# 4. Set `tensorflow` pseudo-random generator at a fixed value
+tf.compat.v1.set_random_seed(seed_value)
+
+'''
+session_conf = tf.compat.v1.ConfigProto(intra_op_parallelism_threads=1, inter_op_parallelism_threads=1)
+sess = tf.compat.v1.Session(graph=tf.compat.v1.get_default_graph(), config=session_conf)
+tf.compat.v1.keras.backend.set_session(sess)
+
+g1 = tf.Graph()
+with g1.as_default():
+    tf.compat.v1.set_random_seed(1)
+    a = tf.compat.v1.get_variable('a', shape=(1,), initializer=tf.keras.initializers.glorot_normal(seed_value))
+with tf.compat.v1.Session(graph=g1) as sess:
+    sess.run(tf.compat.v1.global_variables_initializer())
+    print(sess.run(a))
+'''
+
+train_size = 32  # Prøv N=12      LAG TESTSETT?? SAMME STØRRELSE
+#  N = 100, 32
+noise = 1  # Note: this is also scale parameter for the neg_log_likelihood distribution, or something. Cannot be 0 (zero).
+
+X = np.linspace(-.5, .5, train_size).reshape(-1, 1)
+# print(X)
+y = f(X, sigma=noise)
+y_test = f(X, sigma=noise)
+# print(y)
+y_true = f(X, sigma=0.0)
+
+X_full = np.concatenate((X, X))
+y_full = np.concatenate((y, y_test))
+
+'''
+# NORMALISATION
+X = np.array(list(map(lambda x: (x - X.mean())/X.std(), X)))
+y = np.array(list(map(lambda x: (x - y.mean())/y.std(), y)))
+y_true = np.array(list(map(lambda x: (x - y_true.mean())/y_true.std(), y_true)))
+'''
+
+'''
+plt.scatter(X, y, marker='+', label='Training data')
+plt.scatter(X, y_test, marker='x', label='Test data', s=10)
+plt.plot(X, y_true, label='Truth')
+plt.title('Noisy training data and ground truth')
+plt.legend()
+plt.show()
+'''
+
+#####________
+
+from keras import activations, initializers
+from keras.layers import Layer
+
+import tensorflow as tf
+import tensorflow_probability as tfp
+
+
+class DenseVariational(Layer):
+    def __init__(self,
+                 units,
+                 kl_weight,
+                 activation=None,
+                 prior_sigma_1=1.5,
+                 prior_sigma_2=.1,
+                 prior_pi=0.5, **kwargs):
+        self.units = units
+        self.kl_weight = kl_weight
+        self.activation = activations.get(activation)
+        self.prior_sigma_1 = prior_sigma_1
+        self.prior_sigma_2 = prior_sigma_2
+        self.prior_pi_1 = prior_pi
+        self.prior_pi_2 = 1.0 - prior_pi
+        self.init_sigma = np.sqrt(self.prior_pi_1 * self.prior_sigma_1 ** 2 +
+                                  self.prior_pi_2 * self.prior_sigma_2 ** 2)
+
+        super().__init__(**kwargs)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0], self.units
+
+    def build(self, input_shape):
+        self.kernel_mu = self.add_weight(name='kernel_mu',
+                                         shape=(input_shape[1], self.units),
+                                         initializer=initializers.random_normal(stddev=self.init_sigma),
+                                         trainable=True)
+        self.bias_mu = self.add_weight(name='bias_mu',
+                                       shape=(self.units,),
+                                       initializer=initializers.random_normal(stddev=self.init_sigma),
+                                       trainable=True)
+        self.kernel_rho = self.add_weight(name='kernel_rho',
+                                          shape=(input_shape[1], self.units),
+                                          initializer=initializers.constant(0.0),
+                                          trainable=True)
+        self.bias_rho = self.add_weight(name='bias_rho',
+                                        shape=(self.units,),
+                                        initializer=initializers.constant(0.0),
+                                        trainable=True)
+        super().build(input_shape)
+
+    def call(self, inputs, **kwargs):
+        kernel_sigma = tf.math.softplus(self.kernel_rho)
+        kernel = self.kernel_mu + kernel_sigma * tf.random.normal(self.kernel_mu.shape)
+
+        bias_sigma = tf.math.softplus(self.bias_rho)
+        bias = self.bias_mu + bias_sigma * tf.random.normal(self.bias_mu.shape)
+
+        self.add_loss(self.kl_loss(kernel, self.kernel_mu, kernel_sigma) +
+                      self.kl_loss(bias, self.bias_mu, bias_sigma))
+
+        return self.activation(K.dot(inputs, kernel) + bias)
+
+    def kl_loss(self, w, mu, sigma):
+        variational_dist = tfp.distributions.Normal(mu, sigma)
+        return self.kl_weight * K.sum(variational_dist.log_prob(w) - self.log_prior_prob(w))
+
+    def log_prior_prob(self, w):
+        comp_1_dist = tfp.distributions.Normal(0.0, self.prior_sigma_1)
+        comp_2_dist = tfp.distributions.Normal(0.0, self.prior_sigma_2)
+        return K.log(self.prior_pi_1 * comp_1_dist.prob(w) +
+                     self.prior_pi_2 * comp_2_dist.prob(w))
+
+
+import warnings
+
+warnings.filterwarnings('ignore')
+
+from keras.layers import Input
+from keras.models import Model
+
+batch_size = int(train_size)    # Can this number be divided by an integer? minibatches can improve learning? How about normalising data?
+num_batches = train_size / batch_size
+
+kl_weight = 1.0 / num_batches
+
+prior_params = {
+    'prior_sigma_1': 1.5,  ###  2.5, 1.5, 0.9 gir bedre verdier for usikkerhetshisto for n=200
+    'prior_sigma_2': .1,   #  2, 30 gir erratisk adferd for n=100, epo=10000
+    'prior_pi': 0.5
+}
+
+#   ??? Kjører dette riktig? Prøv å rydde opp i layers. Vær sikker på at arkitekturen er som skal.
+# La til ekstra layer
+"""
+x_in = Input(shape=(1,))
+x = DenseVariational(40, kl_weight, **prior_params, activation='tanh')(x_in)
+x = DenseVariational(20, kl_weight, **prior_params, activation='relu')(x)
+#x = DenseVariational(10, kl_weight, **prior_params, activation='relu')(x)
+x = DenseVariational(1, kl_weight, **prior_params)(x)
+model = Model(x_in, x)
+"""
+###   Model creation! this contains param attributes
+
+from keras import callbacks, optimizers
+
+
+# Here: uses data simulation param "noise". This sigma can be found from sample in applied settings. ###
+def neg_log_likelihood(y_obs, y_pred, sigma=noise):
+    dist = tfp.distributions.Normal(loc=y_pred, scale=sigma)
+    return K.sum(-dist.log_prob(y_obs))
+
+
+import tqdm
+
+X_grid = np.linspace(-.7, .7, 300).reshape(-1, 1)  # .reshape lager en radvektor. Inndelinga definerer hvor grovkornet
+X_grid_true = np.linspace(-.7, .7, 300).reshape(-1, 1)
+MSEs = []
+MSEs_test = []
+GoFs = []
+NaNs = []
+means_list = []  ### = np.empty(1000,1) better ? can plt.plot plot lists against np.arrays?
+y_pred_list = []
+n_means = 1  # How many means are created from blue lines
+n_simulations = 150  # How many blue lines are drawn
+terminate = callbacks.TerminateOnNaN()
+
+elu = lambda x: tf.keras.activations.elu(x,alpha=.5)
+gelu = lambda x: tf.keras.activations.gelu(x)
+
+starttime = time.perf_counter()
+
+x_in = Input(shape=(1,))
+x = DenseVariational(5, kl_weight, **prior_params, activation='relu')(x_in)  # 285 nodes
+#x = DenseVariational(5, kl_weight, **prior_params, activation='relu')(x)
+# x = DenseVariational(30, kl_weight, **prior_params, activation='tanh')(x)
+# x = DenseVariational(30, kl_weight, **prior_params, activation='tanh')(x)
+x = DenseVariational(1, kl_weight, **prior_params)(x)
+model1 = Model(x_in, x)
+
+#model1.load_weights('my_weights')
+
+model1.compile(loss=neg_log_likelihood, optimizer=optimizers.Adam(learning_rate=0.006), metrics=['mse'])
+hist = model1.fit(X_full, y_full, batch_size=batch_size, epochs=15000, verbose=2, callbacks=[terminate],
+                      validation_split=.5);  # fit to X,y_true? will this give mean?
+model1.save_weights('my_weights',overwrite=1)
+endtime = time.perf_counter()
+
+nancount = 0
+
+for i in tqdm.tqdm(range(n_simulations)):  # Draws blue lines from a fitted model
+    y_pred = model1.predict(X_grid)
+    # print('\n type of y_pred is: ', type(y_pred)) - - This is a numpy.ndarray.
+    if np.count_nonzero(np.isnan(y_pred)):
+        nancount += 1
+    else:
+        y_pred_list.append(y_pred)
+
+print('nancount', nancount)
+NaNs.append(nancount)
+# print(type(y_pred_list))
+y_preds = np.concatenate(y_pred_list, axis=1)  # Contains n_simulations number of realisations (blue lines)
+# print('y_preds',y_preds)
+# print(type(y_preds))
+y_mean = np.mean(y_preds, axis=1)
+y_sigma = np.std(y_preds, axis=1)
+# print(type(y_mean.shape))
+# print('y_mean shape', y_mean.reshape(1000,1).shape)
+# print('y_mean',y_mean.reshape(1000,1).T.shape)
+
+print(y_mean.shape)
+# if y_mean contains NaN:
+# NaN_count += 1
+print(model1.summary())
+print('time to fit model: ', endtime-starttime)
+
+print('attr of model', dir(model1.get_layer('dense_variational_1')), model1.get_layer('dense_variational_1'))
+print('params', model1.get_layer('dense_variational_1').prior_sigma_1,
+          model1.get_layer('dense_variational_1').prior_sigma_2,
+          model1.get_layer('dense_variational_1').prior_pi_1, model1.get_layer('dense_variational_1').prior_pi_2)
+# The above line shows these params are not trainable - printed values are as inits
+ # print('parameter value', model.get_weights())
+
+means_list.append(y_mean.reshape(-1, 1))  # had shape (1000,) before reshape, i.e. (-1,) which is an np.array vector
+
+# MSE
+squares_list = []
+squares_list_test = []
+for i in list(X):
+    # Find index of grid value larger than dataset X value number i
+    val = list(X_grid).index(min(filter(lambda j: j > i, X_grid)))
+    squares_list.append((y_mean[val] - y[list(X).index(i)]) ** 2)
+    squares_list_test.append((y_mean[val] - y_test[list(X).index(i)]) ** 2)
+MSEs.append(np.mean(squares_list))
+MSEs_test.append(np.mean(squares_list_test))
+
+print('MSE: ', hist.history['mse'][-1], '  MSEtest: ', hist.history['val_mse'][-1],'Loss: ', hist.history['loss'][-1],'Losstest: ', hist.history['val_loss'][-1])
+#tuples_of_mses = [(hist.history['mse'][-10000+i:-10000+i+1],hist.history['val_mse'][-10000+i:-10000+i+1]) for i in range(9999)]
+tuples_of_mses1 = [(hist.history['mse'][-3000+i:-3000+i+1],hist.history['val_mse'][-3000+i:-3000+i+1]) for i in range(2999)]
+#print('sorted 100 MSEs:', sorted(tuples_of_mses))
+print('sorted 100 MSEs:', sorted(tuples_of_mses1))
+
+
+
+plt.plot(hist.history['mse'],linewidth=.4)
+plt.plot(hist.history['val_mse'],linewidth=.4,alpha=.7)
+plt.title('Model MSE: Train vs Validation')
+# plt.yscale('symlog')
+plt.xlabel('epochs')
+plt.ylabel('MSE')
+leg = plt.legend(['Train MSE','Validation MSE'], loc='upper right')
+for i in leg.get_lines():
+    plt.setp(i,linewidth = 2)
+#plt.setp(leg.get_lines()[0],linewidth=2)
+#plt.setp(leg.get_lines()[1],linewidth=2)
+plt.show()
+
+plt.plot(hist.history['mse'],linewidth=.4)
+plt.plot(hist.history['val_mse'],linewidth=.4,alpha=.7)
+plt.title('Model log(MSE): Train vs Validation')
+plt.yscale('symlog')
+plt.xlabel('epochs')
+plt.ylabel('log(MSE)')
+leg = plt.legend(['Train MSE','Validation MSE'], loc='upper right')
+for i in leg.get_lines():
+    plt.setp(i,linewidth = 2)
+#plt.setp(leg.get_lines()[0],linewidth=2)
+#plt.setp(leg.get_lines()[1],linewidth=2)
+plt.show()
+
+# delete the current Keras model, allowing the next "for-loop" iteration to create a new model from scratch
+K.clear_session()
+gc.collect()
+del model1
+
+means = np.concatenate(means_list, axis=1)
+# print(type(means))
+# print('X_test',X_test[0])
+# print('means',means[0])
+
+
+# plt.plot(X_grid, y_preds, 'b-')  # blue simulations
+plt.plot(X_grid_true, f(X_grid_true, sigma=0), label='Truth')  ####
+plt.scatter(X, y, marker='+', label='Training data')
+plt.scatter(X, y_test, marker='+', label='Test data')
+
+# print('mean,sigma: ',y_mean,y_sigma)
+plt.fill_between(X_grid.ravel(), y_mean + 2 * y_sigma,y_mean - 2 * y_sigma, alpha=0.5, label='2x std.dev. bounds')
+plt.plot(X_grid, means, 'r-')  # plt.plot(X_test, means, 'r-', label='Predictive mean');
+plt.title('Prediction')
+
+plt.legend()
+plt.show()
+
+placement_list = []
+# Evaluate order statistic
+# Lager denne ordentlige histogram for rank stats? sjekk loops
+for i in range(len(X)):
+    index = next(x[0] for x in enumerate(X_grid) if x[1] > X[i])
+    # print('index', index, X_grid[index])   # shows placement in grid, by grid index
+    y_preds[index].sort()
+    place = len([j for j in y_preds[index] if j < y_test[i]])
+    placement_list.append(place)
+
+data = placement_list
+
+# print('data', data)  # Prints histogram placements
+
+# fixed bin size
+bins = np.linspace(math.ceil(min(data)), math.floor(max(data)), 6)
+
+# Confidence interval based histograms for uncertainty
+print('histogram min, max: ', [min(data) - 5, max(data) + 5])
+plt.xlim([min(data) - 5, max(data) + 5])
+plt.hist(data, bins=bins, alpha=0.5)
+#plt.title('Rankings of observed y-values in sorted list of simulated y-values. Histogram with 10 bins')
+plt.title('Rank statistics: observed responses among variational simutations')
+plt.xlabel('Observed response placement in 5-quantiles of var.sim.\'s')
+plt.ylabel('count')
+plt.show()
+
+print('MSEs', MSEs)
+print('MSEs_test', MSEs_test)
+print('NaNs', NaNs)
+
+'''
+# Writing MSEs to file
+e1 = '\nMSE: ' + str(MSEs)
+e2 = '\nMSE_test: ' + str(MSEs_test)
+f = open('aaMSE.txt','a')
+f.write(e1)
+f.write(e2)
+f.close()
+f = open('aaMSE.txt','r') #Read back
+print(f.read())
+'''
+
+'''
+### Method for computing MSE
+y_predictions = model.predict(X) # = y_preds  #  Note: model.predict() is a random function! y_predictions is static, since it's one single model fit
+# Using = y_preds here gives MSE about 300 times larger. Has to do with subtracting a number y[i] from an np.array y_predictions[i]?
+
+
+for i in range(len(X)):
+    print('ys', X[i], y_predictions[i])
+    MSE.append(y_predictions[i] - y[i])
+print('MSE', sum([i**2 for i in MSE])/len(X))
+
+
+def myMSE(x,y_hat,y_data):  # Call on model.predict(X),
+    mseList = []
+    for i in range(len(x)):
+        mseList.append((y_hat[i] - y_data[i])**2)
+    return mean(i[0] for i in mseList)
+
+print('MSE', myMSE(X,y_predictions,y))
+'''
+
+##  Implement NaN counters
+##  MSE (RSS) should be mean for all red lines
